@@ -1,4 +1,4 @@
-Basic RAG Architecture implementation of Llama 3.1 8b Model using local Ollama integration. 
+Basic RAG Architecture implementation of Llama 3.1 8b Model using local Ollama integration for The Hobbit book by Tolkien. 
 
 How to run:
 
