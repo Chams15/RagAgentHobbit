@@ -4,7 +4,8 @@ How to run:
 
 1. Clone repo
 2. Make sure Ollama is running and has the appropriate models needed (run "ollama pull llama3.1" and "ollama pull nomic-embed-text" otherwise)
-3. Run vector.py first
-4. Run main.py
-5. Pray it works
+3. Install all the libraries needed using the requirements.txt
+4. Run vector.py first
+5. Run main.py
+6. Pray it works
 
