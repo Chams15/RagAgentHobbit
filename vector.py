@@ -1,78 +1,235 @@
 import re
 from pathlib import Path
 from functools import lru_cache
+import warnings
 
 from langchain_chroma import Chroma
 from langchain_ollama import OllamaEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
 from langchain_core.stores import InMemoryStore
 from langchain_core.documents import Document
+from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_community.document_compressors import FlashrankRerank
-from langchain_classic.retrievers import ContextualCompressionRetriever, EnsembleRetriever, ParentDocumentRetriever     
+from langchain_classic.retrievers import ContextualCompressionRetriever, EnsembleRetriever, ParentDocumentRetriever
 from langchain_community.retrievers import BM25Retriever
 
 SOURCE_FILE = "TheHobbit.md"
 DB_LOCATION = "./chroma_db"
 
-# Track objects that need cleanup
 _active_resources = {}
+_source_file_mtime = None 
+
+_ROMAN_MAP = {
+    "I": 1, "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6, "VII": 7,
+    "VIII": 8, "IX": 9, "X": 10, "XI": 11, "XII": 12, "XIII": 13,
+    "XIV": 14, "XV": 15, "XVI": 16, "XVII": 17, "XVIII": 18, "XIX": 19,
+}
+_NUM_TO_ROMAN = {v: k for k, v in _ROMAN_MAP.items()}
 
 
+_CHAPTER_TITLES = {
+    1: "AN UNEXPECTED PARTY",
+    2: "ROAST MUTTON",
+    3: "A SHORT REST",
+    4: "OVER HILL AND UNDER HILL",
+    5: "RIDDLES IN THE DARK",
+    6: "OUT OF THE FRYING-PAN INTO THE FIRE",
+    7: "QUEER LODGINGS",
+    8: "FLIES AND SPIDERS",
+    9: "BARRELS OUT OF BOND",
+    10: "A WARM WELCOME",
+    11: "ON THE DOORSTEP",
+    12: "INSIDE INFORMATION",
+    13: "NOT AT HOME",
+    14: "FIRE AND WATER",
+    15: "THE GATHERING OF THE CLOUDS",
+    16: "A THIEF IN THE NIGHT",
+    17: "THE CLOUDS BURST",
+    18: "THE RETURN JOURNEY",
+    19: "THE LAST STAGE",
+}
+
+
+_CHAPTER_PATTERN = re.compile(
+    r"\b(?:chapter|ch\.?)\s+([0-9]{1,2}|[IVXLC]+)\b", re.IGNORECASE
+)
+
+
+def detect_chapter(query: str) -> str | None:
+    """Extract the chapter's metadata title from a user query, if a chapter is mentioned.
+    
+    Returns the chapter title as stored in metadata (e.g. 'AN UNEXPECTED PARTY') or None.
+    """
+    match = _CHAPTER_PATTERN.search(query)
+    if not match:
+        return None
+    value = match.group(1).strip()
+    
+    # Convert to a chapter number
+    chapter_num = None
+    if value.upper() in _ROMAN_MAP:
+        chapter_num = _ROMAN_MAP[value.upper()]
+    else:
+        try:
+            chapter_num = int(value)
+        except ValueError:
+            return None
+    
+    return _CHAPTER_TITLES.get(chapter_num)
+
+
+@lru_cache(maxsize=1)
 def _load_raw_text():
+    global _source_file_mtime
+    _source_file_mtime = Path(SOURCE_FILE).stat().st_mtime
     return Path(SOURCE_FILE).read_text(encoding="utf-8")
+
+def _check_source_file_freshness():
+    """Warn if source file has been modified since cache was loaded."""
+    global _source_file_mtime
+    if _source_file_mtime is None:
+        return 
+    
+    try:
+        current_mtime = Path(SOURCE_FILE).stat().st_mtime
+        if current_mtime > _source_file_mtime:
+            warnings.warn(
+                f"Source file '{SOURCE_FILE}' has been modified. "
+                f"Consider restarting to refresh the embeddings.",
+                UserWarning
+            )
+    except OSError:
+        pass
 
 @lru_cache(maxsize=1)
 def get_embeddings():
-    return OllamaEmbeddings(model="nomic-embed-text")
+    try:
+        return OllamaEmbeddings(model="mxbai-embed-large")
+    except Exception as e:
+        raise RuntimeError(f"Failed to initialize Ollama embeddings: {str(e)}") from e
 
-def get_advanced_retriever(llm=None):
+@lru_cache(maxsize=1)
+def _get_parent_docs():
+    """Parse and cache chapter-split documents (avoids re-parsing on every call)."""
     raw_text = _load_raw_text()
-    
-    # 1. Split by Chapter Headers first
     headers_to_split_on = [("##", "Chapter")]
     md_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on)
-    parent_docs = md_splitter.split_text(raw_text)
+    return tuple(md_splitter.split_text(raw_text))
 
-    # 2. Setup Vectorstore and Storage for Parent-Child relationship
+
+def get_advanced_retriever(llm=None):
+    _check_source_file_freshness()
+    parent_docs = list(_get_parent_docs())
+
+    enriched_docs = []
+    for doc in parent_docs:
+        chapter = doc.metadata.get("Chapter", "")
+        if chapter:
+            enriched_content = f"[{chapter}] {doc.page_content}"
+        else:
+            enriched_content = doc.page_content
+        enriched_docs.append(Document(
+            page_content=enriched_content,
+            metadata=doc.metadata.copy(),
+        ))
+
     vectorstore = Chroma(
         collection_name="split_parents",
         embedding_function=get_embeddings(),
         persist_directory=DB_LOCATION
     )
     store = InMemoryStore()
-    
-    # Child chunks for precise retrieval, Parents for context
-    child_splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=50)
+
+    child_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=800,
+        chunk_overlap=100,
+        separators=["\n\n", "\n", ". ", " ", ""],
+    )
+
+    try:
+        collection_count = vectorstore._collection.count()
+        if collection_count == 0:
+            try:
+                vectorstore.delete_collection()
+            except Exception:
+                pass
+            vectorstore = Chroma(
+                collection_name="split_parents",
+                embedding_function=get_embeddings(),
+                persist_directory=DB_LOCATION
+            )
+    except Exception as e:
+        try:
+            vectorstore.delete_collection()
+        except Exception:
+            pass
+        vectorstore = Chroma(
+            collection_name="split_parents",
+            embedding_function=get_embeddings(),
+            persist_directory=DB_LOCATION
+        )
     
     parent_retriever = ParentDocumentRetriever(
         vectorstore=vectorstore,
         docstore=store,
         child_splitter=child_splitter,
         parent_splitter=RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=200),
+        search_kwargs={"k": 8},  # Over-fetch child matches for better parent coverage
     )
-    
-    parent_retriever.add_documents(parent_docs)
 
-    # Track resources for cleanup
+    parent_retriever.add_documents(enriched_docs)
+
     _active_resources["vectorstore"] = vectorstore
     _active_resources["docstore"] = store
     _active_resources["parent_docs"] = parent_docs
 
-    # 3. Hybrid Search Setup (BM25 + Vector)
-    bm25_retriever = BM25Retriever.from_documents(parent_docs)
-    bm25_retriever.k = 4
+    # BM25 should search over parent-sized chunks, not whole chapters
+    # This prevents giant chapter docs from drowning out precise matches
+    parent_splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=200)
+    bm25_chunks = []
+    for doc in enriched_docs:
+        bm25_chunks.extend(parent_splitter.split_documents([doc]))
+    bm25_retriever = BM25Retriever.from_documents(bm25_chunks)
+    bm25_retriever.k = 8
 
     ensemble_retriever = EnsembleRetriever(
         retrievers=[bm25_retriever, parent_retriever],
-        weights=[0.3, 0.7] # Heavily weight the parent/vector retrieval
+        weights=[0.3, 0.7]
     )
 
-    # 4. Reranking for final precision
+    
     compressor = FlashrankRerank(top_n=5)
-    return ContextualCompressionRetriever(
+    reranked_retriever = ContextualCompressionRetriever(
         base_compressor=compressor,
         base_retriever=ensemble_retriever
     )
+
+    return ChapterAwareRetriever(base_retriever=reranked_retriever)
+
+
+class ChapterAwareRetriever:
+    """Wraps a retriever to post-filter by chapter metadata when a chapter is mentioned in the query."""
+
+    def __init__(self, base_retriever):
+        self.base_retriever = base_retriever
+
+    def invoke(self, query: str, **kwargs) -> list[Document]:
+        docs = self.base_retriever.invoke(query, **kwargs)
+        chapter_title = detect_chapter(query)
+        if chapter_title:
+           
+            filtered = [
+                d for d in docs
+                if d.metadata.get("Chapter", "").upper() == chapter_title.upper()
+            ]
+            
+            return filtered if filtered else docs
+        return docs
+
+    def __or__(self, other):
+        """Support `retriever | format_docs` pipe syntax."""
+        from langchain_core.runnables import RunnableLambda
+        return RunnableLambda(self.invoke) | other
 
 @lru_cache(maxsize=1)
 def get_book_metadata() -> str:
@@ -83,13 +240,13 @@ def get_book_metadata() -> str:
     total_chars = len(raw_text)
     total_paragraphs = len([p for p in raw_text.split("\n\n") if p.strip()])
 
-    # Parse chapter headers and their subtitles (e.g. "## Chapter I" followed by "## AN UNEXPECTED PARTY")
+   
     chapter_pattern = re.compile(
         r"^##\s+(Chapter\s+[IVXLC]+)\s*\n+##\s+(.+)$", re.MULTILINE
     )
     chapter_matches = list(chapter_pattern.finditer(raw_text))
 
-    # Compute per-chapter stats
+    
     chapter_details = []
     for i, match in enumerate(chapter_matches):
         chapter_num = match.group(1).strip()
@@ -124,7 +281,6 @@ def cleanup():
     """Release all in-memory resources: vectorstore client, docstore, caches."""
     import gc
 
-    # Close the Chroma vectorstore client
     vs = _active_resources.pop("vectorstore", None)
     if vs is not None:
         try:
@@ -137,23 +293,23 @@ def cleanup():
             pass
         del vs
 
-    # Clear the in-memory docstore
+   
     store = _active_resources.pop("docstore", None)
     if store is not None:
         store.mdelete(list(store.yield_keys()))
         del store
 
-    # Clear cached parent docs
+    
     _active_resources.pop("parent_docs", None)
 
-    # Clear any remaining tracked resources
+   
     _active_resources.clear()
 
-    # Clear lru_caches
+    
     get_embeddings.cache_clear()
     get_book_metadata.cache_clear()
 
-    # Force garbage collection
+    
     gc.collect()
     print("Memory cleaned up.")
 
@@ -165,11 +321,11 @@ if __name__ == "__main__":
         shutil.rmtree(DB_LOCATION)
         print(f"Deleted existing DB at {DB_LOCATION}")
     
-    # Build the retriever (which populates the vectorstore)
+    
     retriever = get_advanced_retriever()
     print(f"Advanced retriever built successfully.")
     
-    # Check the vectorstore
+    
     vectorstore = Chroma(
         collection_name="split_parents",
         embedding_function=get_embeddings(),
