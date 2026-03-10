@@ -34,7 +34,7 @@ setup(
     long_description_content_type="text/markdown",
     author="Your Name",
     author_email="your.email@example.com",
-    url="https://github.com/yourusername/hobbit-scholar",
+    url="https://github.com/Chams15/RagAgentHobbit",
     py_modules=["main", "vector"],
     install_requires=INSTALL_REQUIRES,
     extras_require={
