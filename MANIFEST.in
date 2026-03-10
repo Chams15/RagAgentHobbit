@@ -1,7 +1,5 @@
 include TheHobbit.md
 include requirements.txt
 include README.md
-include LICENSE
-recursive-include tests *
 global-exclude __pycache__
 global-exclude *.py[co]
