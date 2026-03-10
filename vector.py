@@ -2,6 +2,9 @@ import re
 from pathlib import Path
 from functools import lru_cache
 import warnings
+import argparse
+import shutil
+import sys
 
 from langchain_chroma import Chroma
 from langchain_ollama import OllamaEmbeddings
@@ -53,6 +56,36 @@ _CHAPTER_TITLES = {
 _CHAPTER_PATTERN = re.compile(
     r"\b(?:chapter|ch\.?)\s+([0-9]{1,2}|[IVXLC]+)\b", re.IGNORECASE
 )
+
+
+def _reset_database_directory() -> None:
+    """Remove the local Chroma DB directory so it can be rebuilt cleanly."""
+    db_path = Path(DB_LOCATION)
+    if db_path.exists():
+        shutil.rmtree(db_path, ignore_errors=True)
+
+
+def _create_vectorstore_with_recovery(verbose: bool = False) -> Chroma:
+    """Create Chroma vectorstore and self-heal common local DB corruption issues."""
+    try:
+        return Chroma(
+            collection_name="split_parents",
+            embedding_function=get_embeddings(),
+            persist_directory=DB_LOCATION,
+        )
+    except Exception as e:
+        error_text = str(e)
+        # This usually indicates broken or incompatible local DB metadata.
+        if "default_tenant" in error_text or "Could not connect to tenant" in error_text:
+            if verbose:
+                print("\nDetected invalid local Chroma state. Rebuilding database...", flush=True)
+            _reset_database_directory()
+            return Chroma(
+                collection_name="split_parents",
+                embedding_function=get_embeddings(),
+                persist_directory=DB_LOCATION,
+            )
+        raise
 
 
 def detect_chapter(query: str) -> str | None:
@@ -117,8 +150,12 @@ def _get_parent_docs():
     return tuple(md_splitter.split_text(raw_text))
 
 
-def get_advanced_retriever(llm=None):
+def get_advanced_retriever(llm=None, verbose=False):
     _check_source_file_freshness()
+    
+    if verbose:
+        print("Loading documents...", end="", flush=True)
+    
     parent_docs = list(_get_parent_docs())
 
     enriched_docs = []
@@ -133,11 +170,10 @@ def get_advanced_retriever(llm=None):
             metadata=doc.metadata.copy(),
         ))
 
-    vectorstore = Chroma(
-        collection_name="split_parents",
-        embedding_function=get_embeddings(),
-        persist_directory=DB_LOCATION
-    )
+    if verbose:
+        print(" ✓\nConnecting to vector database...", end="", flush=True)
+    
+    vectorstore = _create_vectorstore_with_recovery(verbose=verbose)
     store = InMemoryStore()
 
     child_splitter = RecursiveCharacterTextSplitter(
@@ -153,21 +189,13 @@ def get_advanced_retriever(llm=None):
                 vectorstore.delete_collection()
             except Exception:
                 pass
-            vectorstore = Chroma(
-                collection_name="split_parents",
-                embedding_function=get_embeddings(),
-                persist_directory=DB_LOCATION
-            )
+            vectorstore = _create_vectorstore_with_recovery(verbose=verbose)
     except Exception as e:
         try:
             vectorstore.delete_collection()
         except Exception:
             pass
-        vectorstore = Chroma(
-            collection_name="split_parents",
-            embedding_function=get_embeddings(),
-            persist_directory=DB_LOCATION
-        )
+        vectorstore = _create_vectorstore_with_recovery(verbose=verbose)
     
     parent_retriever = ParentDocumentRetriever(
         vectorstore=vectorstore,
@@ -177,12 +205,18 @@ def get_advanced_retriever(llm=None):
         search_kwargs={"k": 8},  # Over-fetch child matches for better parent coverage
     )
 
+    if verbose:
+        print(" ✓\nIndexing documents...", end="", flush=True)
+    
     parent_retriever.add_documents(enriched_docs)
 
     _active_resources["vectorstore"] = vectorstore
     _active_resources["docstore"] = store
     _active_resources["parent_docs"] = parent_docs
 
+    if verbose:
+        print(" ✓\nBuilding search indices...", end="", flush=True)
+    
     # BM25 should search over parent-sized chunks, not whole chapters
     # This prevents giant chapter docs from drowning out precise matches
     parent_splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=200)
@@ -197,6 +231,8 @@ def get_advanced_retriever(llm=None):
         weights=[0.3, 0.7]
     )
 
+    if verbose:
+        print(" ✓\nInitializing reranker...", end="", flush=True)
     
     compressor = FlashrankRerank(top_n=5)
     reranked_retriever = ContextualCompressionRetriever(
@@ -204,6 +240,9 @@ def get_advanced_retriever(llm=None):
         base_retriever=ensemble_retriever
     )
 
+    if verbose:
+        print(" ✓")
+    
     return ChapterAwareRetriever(base_retriever=reranked_retriever)
 
 
@@ -284,10 +323,6 @@ def cleanup():
     vs = _active_resources.pop("vectorstore", None)
     if vs is not None:
         try:
-            vs.delete_collection()
-        except Exception:
-            pass
-        try:
             del vs._client
         except Exception:
             pass
@@ -314,23 +349,154 @@ def cleanup():
     print("Memory cleaned up.")
 
 
-if __name__ == "__main__":
+def initialize_database(source_file=None, db_location=None, force=False):
+    """Initialize or reinitialize the vector database."""
+    global SOURCE_FILE, DB_LOCATION
     
-    import shutil
+    if source_file:
+        SOURCE_FILE = source_file
+    if db_location:
+        DB_LOCATION = db_location
+    
+    # Validate source file exists
+    if not Path(SOURCE_FILE).exists():
+        print(f"Error: Source file '{SOURCE_FILE}' not found.", file=sys.stderr)
+        return False
+    
+    # Handle existing database
     if Path(DB_LOCATION).exists():
-        shutil.rmtree(DB_LOCATION)
-        print(f"Deleted existing DB at {DB_LOCATION}")
+        if not force:
+            response = input(f"Database at '{DB_LOCATION}' already exists. Delete and rebuild? (y/N): ")
+            if response.lower() not in ['y', 'yes']:
+                print("Initialization cancelled.")
+                return False
+        
+        try:
+            shutil.rmtree(DB_LOCATION)
+            print(f"✓ Deleted existing database at {DB_LOCATION}")
+        except Exception as e:
+            print(f"Error deleting database: {str(e)}", file=sys.stderr)
+            return False
     
+    # Build the retriever (this creates and populates the database)
+    try:
+        print(f"Building vector database from '{SOURCE_FILE}'...")
+        retriever = get_advanced_retriever(verbose=True)
+        print("✓ Advanced retriever built successfully")
+    except Exception as e:
+        print(f"Error building retriever: {str(e)}", file=sys.stderr)
+        return False
     
-    retriever = get_advanced_retriever()
-    print(f"Advanced retriever built successfully.")
-    
-    
-    vectorstore = Chroma(
-        collection_name="split_parents",
-        embedding_function=get_embeddings(),
-        persist_directory=DB_LOCATION,
-    )
-    count = vectorstore._collection.count()
-    print(f"Chroma DB at {DB_LOCATION} with {count} chunks.")
+    # Verify the database
+    try:
+        vectorstore = Chroma(
+            collection_name="split_parents",
+            embedding_function=get_embeddings(),
+            persist_directory=DB_LOCATION,
+        )
+        count = vectorstore._collection.count()
+        print(f"✓ Database created at '{DB_LOCATION}' with {count} chunks")
+        print("\nInitialization complete! You can now run the chatbot with 'python main.py'")
+        return True
+    except Exception as e:
+        print(f"Error verifying database: {str(e)}", file=sys.stderr)
+        return False
 
+
+def parse_arguments():
+    """Parse command-line arguments for vector database initialization."""
+    parser = argparse.ArgumentParser(
+        description="Initialize vector database for The Hobbit RAG chatbot",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Initialize with defaults (TheHobbit.md -> ./chroma_db)
+  python vector.py
+  
+  # Force rebuild without confirmation
+  python vector.py --force
+  
+  # Use a different source file
+  python vector.py --source MyBook.md
+  
+  # Specify custom database location
+  python vector.py --db ./my_custom_db
+  
+  # Show database info without rebuilding
+  python vector.py --info
+        """
+    )
+    
+    parser.add_argument(
+        "-s", "--source",
+        type=str,
+        default="TheHobbit.md",
+        help="Source markdown file to process (default: TheHobbit.md)"
+    )
+    
+    parser.add_argument(
+        "-d", "--db",
+        type=str,
+        default="./chroma_db",
+        help="Database directory path (default: ./chroma_db)"
+    )
+    
+    parser.add_argument(
+        "-f", "--force",
+        action="store_true",
+        help="Force rebuild without confirmation if database exists"
+    )
+    
+    parser.add_argument(
+        "-i", "--info",
+        action="store_true",
+        help="Display book metadata and exit (no database initialization)"
+    )
+    
+    parser.add_argument(
+        "-v", "--version",
+        action="version",
+        version="Vector DB Initializer v1.0.0"
+    )
+    
+    return parser.parse_args()
+
+
+def main_cli():
+    """Entry point for console script (used by setup.py)."""
+    args = parse_arguments()
+    
+    # Update global constants if custom paths provided
+    if args.source:
+        global SOURCE_FILE
+        SOURCE_FILE = args.source
+    if args.db:
+        global DB_LOCATION
+        DB_LOCATION = args.db
+    
+    # Info mode: just show metadata
+    if args.info:
+        try:
+            metadata = get_book_metadata()
+            print("\n" + "="*60)
+            print("  Book Metadata")
+            print("="*60)
+            print(metadata)
+            print("="*60)
+            sys.exit(0)
+        except Exception as e:
+            print(f"Error: {str(e)}", file=sys.stderr)
+            sys.exit(1)
+    
+    # Initialize the database
+    success = initialize_database(
+        source_file=args.source if args.source != "TheHobbit.md" else None,
+        db_location=args.db if args.db != "./chroma_db" else None,
+        force=args.force
+    )
+    
+    sys.exit(0 if success else 1)
+
+
+if __name__ == "__main__":
+    main_cli()

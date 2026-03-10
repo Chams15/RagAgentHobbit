@@ -3,6 +3,7 @@ import signal
 import time
 from collections import deque
 import sys
+import argparse
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough, RunnableLambda
@@ -34,25 +35,42 @@ def format_docs(docs):
     unique_contents = list(dict.fromkeys(doc.page_content for doc in docs))
     return "\n\n---\n\n".join(unique_contents)
 
-def build_rag_chain():
+# Global cache for lazy-loaded retriever
+_cached_retriever = None
+_cached_metadata = None
+
+def get_or_create_retriever(verbose=True):
+    """Lazy-load the retriever only when needed."""
+    global _cached_retriever, _cached_metadata
+    
+    if _cached_retriever is None:
+        if verbose:
+            print("Loading knowledge base...")
+        try:
+            _cached_retriever = get_advanced_retriever(verbose=verbose)
+            _cached_metadata = get_book_metadata()
+            if verbose:
+                print("Knowledge base ready!\n")
+        except Exception as e:
+            print(f"\n\nError: Failed to load retriever. {str(e)}")
+            print("Try rebuilding the local vector DB with: hobbit-init --force")
+            sys.exit(1)
+    
+    return _cached_retriever, _cached_metadata
+
+def build_rag_chain(model_name="llama3.1", temperature=0.1, num_ctx=12000, test_connection=False):
     try:
         model = OllamaLLM(
-            model="llama3.1",
-            temperature=0.1,
-            num_ctx=12000,
+            model=model_name,
+            temperature=temperature,
+            num_ctx=num_ctx,
         )
-        # Test connection to Ollama
-        _ = model.invoke("test")
+        # Skip connection test at startup for faster launch
+        if test_connection:
+            _ = model.invoke("test")
     except Exception as e:
-        print(f"\nError: Failed to connect to Ollama. Make sure Ollama is running.")
+        print(f"\nError: Failed to initialize Ollama model.")
         print(f"Details: {str(e)}")
-        sys.exit(1)
-    
-    try:
-        retriever = get_advanced_retriever(llm=model)
-        metadata = get_book_metadata()
-    except Exception as e:
-        print(f"\nError: Failed to initialize retriever. {str(e)}")
         sys.exit(1)
 
     template = """
@@ -78,28 +96,37 @@ Question: {question}
 """
     prompt = ChatPromptTemplate.from_template(template)
 
+    # Lazy-load retriever on first use
+    def get_context_with_lazy_load(inputs):
+        retriever, _ = get_or_create_retriever(verbose=True)
+        docs = retriever.invoke(inputs["question"])
+        return format_docs(docs)
+    
+    def get_metadata_with_lazy_load(_):
+        _, metadata = get_or_create_retriever(verbose=False)
+        return metadata
+
     return (
         {
-            "context": (lambda x: x["question"]) | RunnableLambda(retriever.invoke) | format_docs,
+            "context": RunnableLambda(get_context_with_lazy_load),
             "question": lambda x: x["question"],
-            "metadata": lambda _: metadata,
+            "metadata": RunnableLambda(get_metadata_with_lazy_load),
             "history": lambda _: format_history(),
         }
         | prompt 
         | model
     )
 
-def main():
-    
-    atexit.register(cleanup)
-    signal.signal(signal.SIGINT, lambda sig, frame: exit(0))  
-
-    print("Initializing Hobbit Scholar RAG...")
-    chain = build_rag_chain()
+def interactive_mode(chain):
+    """Run the chatbot in interactive mode with continuous Q&A."""
+    print("\n" + "="*60)
+    print("  The Hobbit Scholar - Interactive Mode")
+    print("="*60)
+    print("Ask questions about Bilbo's journey. Type 'exit' or 'quit' to leave.\n")
     
     while True:
         try:
-            query = input("\nWhat would you like to know about Bilbo's journey? (exit to quit): ").strip()
+            query = input("Question: ").strip()
             
             # Validate input
             if not query:
@@ -107,6 +134,7 @@ def main():
                 continue
             
             if query.lower() in ["exit", "quit"]:
+                print("\nFarewell, dear scholar! May your travels be as memorable as Bilbo's.")
                 break
             
             if len(query) > 1000:
@@ -134,14 +162,143 @@ def main():
             chat_history.append((query, full_response))
             
         except KeyboardInterrupt:
-            print("\nExiting...")
+            print("\n\nExiting gracefully...")
             break
         except Exception as e:
             print(f"\nUnexpected error: {str(e)}")
             continue
+
+def single_query_mode(chain, question, verbose=False):
+    """Answer a single question and exit."""
+    if not question or not question.strip():
+        print("Error: Empty question provided.")
+        sys.exit(1)
+    
+    if len(question) > 1000:
+        print("Error: Question too long. Please keep it under 1000 characters.")
+        sys.exit(1)
+    
+    start_time = time.perf_counter()
+    
+    if verbose:
+        print(f"\nQuestion: {question}\n")
+        print("Consulting the archives...\n")
+        print("Response: ", end="", flush=True)
+    
+    try:
+        response_chunks = []
+        for chunk in chain.stream({"question": question}):
+            if verbose:
+                print(chunk, end="", flush=True)
+            response_chunks.append(chunk)
         
-        # Save this turn to conversation history
-        chat_history.append((query, "".join(response_chunks)))
+        full_response = "".join(response_chunks)
+        
+        if verbose:
+            elapsed = time.perf_counter() - start_time
+            print(f"\n\n[{elapsed:.1f}s]")
+        else:
+            print(full_response)
+            
+    except Exception as e:
+        print(f"\nError: {str(e)}", file=sys.stderr)
+        sys.exit(1)
+
+def parse_arguments():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="The Hobbit Scholar - RAG-powered Chatbot for answering questions about The Hobbit",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Interactive mode (default)
+  python main.py
+  
+  # Ask a single question
+  python main.py -q "Who is Bilbo Baggins?"
+  
+  # Use a different Ollama model
+  python main.py --model llama3.2
+  
+  # Adjust creativity
+  python main.py -q "Describe Smaug" --temperature 0.5
+  
+  # Non-verbose output (just the answer)
+  python main.py -q "What is Sting?" --quiet
+        """
+    )
+    
+    parser.add_argument(
+        "-q", "--query", "--question",
+        type=str,
+        help="Ask a single question and exit (non-interactive mode)"
+    )
+    
+    parser.add_argument(
+        "-m", "--model",
+        type=str,
+        default="llama3.1",
+        help="Ollama model to use (default: llama3.1)"
+    )
+    
+    parser.add_argument(
+        "-t", "--temperature",
+        type=float,
+        default=0.1,
+        help="Model temperature for creativity (0.0-1.0, default: 0.1)"
+    )
+    
+    parser.add_argument(
+        "-c", "--context-size",
+        type=int,
+        default=12000,
+        help="Model context window size (default: 12000)"
+    )
+    
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Minimal output (only show answer in single-query mode)"
+    )
+    
+    parser.add_argument(
+        "-v", "--version",
+        action="version",
+        version="The Hobbit Scholar v1.0.0"
+    )
+    
+    return parser.parse_args()
+
+def main():
+    """Main entry point for the CLI application."""
+    args = parse_arguments()
+    
+    atexit.register(cleanup)
+    signal.signal(signal.SIGINT, lambda sig, frame: exit(0))
+    
+    # Fast initialization - build chain without loading retriever yet
+    if not args.quiet:
+        print("Initializing Hobbit Scholar...")
+    
+    try:
+        chain = build_rag_chain(
+            model_name=args.model,
+            temperature=args.temperature,
+            num_ctx=args.context_size,
+            test_connection=False  # Skip connection test for faster startup
+        )
+        
+        if not args.quiet:
+            print("Ready! (Knowledge base will load on first query)\n")
+    except Exception as e:
+        print(f"Failed to initialize: {str(e)}", file=sys.stderr)
+        sys.exit(1)
+    
+    # Run in appropriate mode
+    if args.query:
+        single_query_mode(chain, args.query, verbose=not args.quiet)
+    else:
+        interactive_mode(chain)
 
 if __name__ == "__main__":
     main()
